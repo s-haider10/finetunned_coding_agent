@@ -13,7 +13,7 @@ Tinker cookbook: https://github.com/thinking-machines-lab/tinker-cookbook
 ### Prerequisites
 
 - Docker (for Sandbox Fusion code execution)
-- `TINKER_API_KEY` environment variable
+- `TINKER_API_KEY` set in the project root `.env` file (auto-loaded via `python-dotenv`)
 - Python 3.13+ with dependencies from `requirements.txt`
 
 ### Setup Steps
@@ -32,10 +32,15 @@ docker run -it -p 8080:8080 \
   volcengine/sandbox-fusion:server-20250609
 ```
 
-**Set environment variables:**
+**Configure API key** in the project root `.env` file:
+
+```
+TINKER_API_KEY="your-api-key"
+```
+
+The key is auto-loaded at startup via `python-dotenv` -- no need to `export` it manually. Optional sandbox overrides can also go in `.env` or be exported:
 
 ```bash
-export TINKER_API_KEY="your-api-key"
 # Optional overrides (defaults shown):
 export SANDBOX_URL="http://localhost:8080/run_code"
 export SANDBOX_MAX_CONCURRENCY="4"
@@ -44,13 +49,13 @@ export SANDBOX_MAX_CONCURRENCY="4"
 **Run training:**
 
 ```bash
-python train.py main
+python train.py
 ```
 
-The project uses `chz` for configuration. Override any config field via CLI:
+The project uses `chz` for configuration. Override any config field via CLI using `key=value` syntax:
 
 ```bash
-python train.py main --learning_rate 1e-5 --max_steps 100 --eval_every 5
+python train.py learning_rate=1e-5 max_steps=100 eval_every=5
 ```
 
 **Monitor:** Logs are written to `~/code-rl-logs/YYYY_MM_DD-HH_MM_SS/` containing:
@@ -149,18 +154,18 @@ We use `agentica-org/DeepCoder-Preview-Dataset` from HuggingFace, which unifies 
 
 **Training splits** (concatenated):
 
-| Split | Source | Nature |
-| --- | --- | --- |
+| Split            | Source                     | Nature                                      |
+| ---------------- | -------------------------- | ------------------------------------------- |
 | `primeintellect` | PrimeIntellect SYNTHETIC-1 | Synthetically generated, diverse difficulty |
-| `taco` | TACO Verified | Curated classic competitive programming |
-| `lcbv5` | LiveCodeBench v5 | Real contest problems, recent |
+| `taco`           | TACO Verified              | Curated classic competitive programming     |
+| `lcbv5`          | LiveCodeBench v5           | Real contest problems, recent               |
 
 **Test splits** (for evaluation):
 
-| Split | Source | Nature |
-| --- | --- | --- |
-| `codeforces` | Codeforces contests | Real competition problems |
-| `lcbv5` | LiveCodeBench v5 | Real contest problems (test portion) |
+| Split        | Source              | Nature                               |
+| ------------ | ------------------- | ------------------------------------ |
+| `codeforces` | Codeforces contests | Real competition problems            |
+| `lcbv5`      | LiveCodeBench v5    | Real contest problems (test portion) |
 
 Each problem contains a natural language description, input/output test cases, and optional starter code (function signatures or boilerplate).
 
@@ -182,20 +187,20 @@ The prompt flows through three stages:
 
 The `Config` class (managed via `chz`) controls all hyperparameters:
 
-| Parameter | Default | Meaning |
-| --- | --- | --- |
-| `model_name` | `Qwen/Qwen3-4B-Instruct-2507` | Base model for LoRA fine-tuning |
-| `batch_size` | 128 | Total completions per training step |
-| `group_size` | 8 | Prompts per batch (so 128/8 = 16 completions per prompt) |
-| `learning_rate` | 4e-5 | Adam LR (~10x higher than full fine-tuning, appropriate for LoRA) |
-| `lora_rank` | 32 | LoRA adapter dimension |
-| `max_tokens` | 24576 | Max generation length in tokens |
-| `temperature` | 1.0 | Sampling temperature (high entropy for exploration) |
-| `format_coef` | 0.1 | Weight for format reward component |
-| `reward_timeout` | 6 | Sandbox timeout per test case (seconds) |
-| `save_every` | 10 | Checkpoint frequency (0 = disabled) |
-| `eval_every` | 10 | Evaluation frequency (-1 = disabled) |
-| `max_steps` | -1 | Training steps (-1 = unlimited) |
+| Parameter        | Default                       | Meaning                                                           |
+| ---------------- | ----------------------------- | ----------------------------------------------------------------- |
+| `model_name`     | `Qwen/Qwen3-4B-Instruct-2507` | Base model for LoRA fine-tuning                                   |
+| `batch_size`     | 128                           | Total completions per training step                               |
+| `group_size`     | 8                             | Prompts per batch (so 128/8 = 16 completions per prompt)          |
+| `learning_rate`  | 4e-5                          | Adam LR (~10x higher than full fine-tuning, appropriate for LoRA) |
+| `lora_rank`      | 32                            | LoRA adapter dimension                                            |
+| `max_tokens`     | 24576                         | Max generation length in tokens                                   |
+| `temperature`    | 1.0                           | Sampling temperature (high entropy for exploration)               |
+| `format_coef`    | 0.1                           | Weight for format reward component                                |
+| `reward_timeout` | 6                             | Sandbox timeout per test case (seconds)                           |
+| `save_every`     | 10                            | Checkpoint frequency (0 = disabled)                               |
+| `eval_every`     | 10                            | Evaluation frequency (-1 = disabled)                              |
+| `max_steps`      | -1                            | Training steps (-1 = unlimited)                                   |
 
 **Derived value:** `completions_per_prompt = batch_size // group_size = 16` -- this is the G in GRPO terminology.
 
@@ -318,11 +323,11 @@ The 4e-5 learning rate is ~10x higher than typical full fine-tuning rates, which
 
 `R = 0.1 * format_score + correctness_score`
 
-| Format OK? | Tests Pass? | format_score | correctness_score | Total R |
-| --- | --- | --- | --- | --- |
-| No | -- (skipped) | -1 | 0 | -0.1 |
-| Yes | No | 0 | 0 | 0.0 |
-| Yes | Yes | 0 | 1 | 1.0 |
+| Format OK? | Tests Pass?  | format_score | correctness_score | Total R |
+| ---------- | ------------ | ------------ | ----------------- | ------- |
+| No         | -- (skipped) | -1           | 0                 | -0.1    |
+| Yes        | No           | 0            | 0                 | 0.0     |
+| Yes        | Yes          | 0            | 1                 | 1.0     |
 
 ### Format Scoring
 
@@ -401,14 +406,14 @@ The sandbox session in `env.py` is a singleton `aiohttp.ClientSession` -- it's c
 
 ### Online Metrics (Every Step)
 
-| Metric | What It Measures |
-| --- | --- |
-| `mean_reward` | Average R across all 128 completions in the batch |
-| `mean_correct` | Fraction with correctness_score = 1 (approximate train-time Pass@1) |
-| `format_rate` | Fraction with valid code fences |
-| `groups_skipped` | How many of the 8 groups were degenerate |
-| `groups_total` | Total groups (always 8) |
-| `n_datums` | Number of non-degenerate training datums |
+| Metric           | What It Measures                                                    |
+| ---------------- | ------------------------------------------------------------------- |
+| `mean_reward`    | Average R across all 128 completions in the batch                   |
+| `mean_correct`   | Fraction with correctness_score = 1 (approximate train-time Pass@1) |
+| `format_rate`    | Fraction with valid code fences                                     |
+| `groups_skipped` | How many of the 8 groups were degenerate                            |
+| `groups_total`   | Total groups (always 8)                                             |
+| `n_datums`       | Number of non-degenerate training datums                            |
 
 ### Periodic Evaluation (Every `eval_every` Steps)
 
@@ -421,12 +426,12 @@ The sandbox session in `env.py` is a singleton `aiohttp.ClientSession` -- it's c
 
 Expected behavior for a correctly wired pipeline:
 
-| Steps | Expected Observation |
-| --- | --- |
-| 1-5 | Format adherence rises sharply (model learns code fences quickly) |
-| 5-15 | `mean_reward` trends upward (noisy but positive slope) |
-| 10-30 | `mean_correct` rises from ~0.05 baseline toward 0.10-0.20 |
-| 20-50 | Pass@1 on eval set shows modest improvement vs. baseline |
+| Steps | Expected Observation                                              |
+| ----- | ----------------------------------------------------------------- |
+| 1-5   | Format adherence rises sharply (model learns code fences quickly) |
+| 5-15  | `mean_reward` trends upward (noisy but positive slope)            |
+| 10-30 | `mean_correct` rises from ~0.05 baseline toward 0.10-0.20         |
+| 20-50 | Pass@1 on eval set shows modest improvement vs. baseline          |
 
 If you don't see these patterns, something is wrong. See Section 9 for diagnostics.
 
@@ -436,28 +441,28 @@ If you don't see these patterns, something is wrong. See Section 9 for diagnosti
 
 ### Common Errors
 
-| Error | Likely Cause | Fix |
-| --- | --- | --- |
-| `TINKER_API_KEY` not set | Missing environment variable | `export TINKER_API_KEY="..."` |
-| Connection refused on port 8080 | Sandbox Docker not running | Start the sandbox container |
-| `SandboxError` in sandbox response | Bad sandbox config or resource limits | Check `sandbox_config/local.yaml` |
-| `Unknown renderer` ValueError | Wrong renderer name string | Use `"qwen3_instruct"` |
-| All groups degenerate every step | Problems too easy or too hard, or G too small | Check reward distribution, try different dataset mix |
-| `chz` CLI parse error | Wrong invocation syntax | Use `python train.py main --field value` |
-| OOM during sampling | max_tokens too high for GPU memory | Reduce `max_tokens` or `batch_size` |
-| Checkpoint not found on resume | `checkpoints.jsonl` missing or corrupted | Check log directory path |
+| Error                              | Likely Cause                                  | Fix                                                  |
+| ---------------------------------- | --------------------------------------------- | ---------------------------------------------------- |
+| `TINKER_API_KEY` not set           | Missing environment variable                  | `export TINKER_API_KEY="..."`                        |
+| Connection refused on port 8080    | Sandbox Docker not running                    | Start the sandbox container                          |
+| `SandboxError` in sandbox response | Bad sandbox config or resource limits         | Check `sandbox_config/local.yaml`                    |
+| `Unknown renderer` ValueError      | Wrong renderer name string                    | Use `"qwen3_instruct"`                               |
+| All groups degenerate every step   | Problems too easy or too hard, or G too small | Check reward distribution, try different dataset mix |
+| `chz` CLI parse error              | Wrong invocation syntax                       | Use `python train.py main --field value`             |
+| OOM during sampling                | max_tokens too high for GPU memory            | Reduce `max_tokens` or `batch_size`                  |
+| Checkpoint not found on resume     | `checkpoints.jsonl` missing or corrupted      | Check log directory path                             |
 
 ### Diagnostic Signals
 
-| Signal | Diagnosis | Remedy |
-| --- | --- | --- |
-| Reward flat at 0 | Problems too hard; no positive signal | Filter easier problems, increase G |
-| Reward flat at 1 | Too easy; model already solves everything | Use harder subset |
-| Format rate dropping | Model degenerating | Check renderer config, reduce learning rate |
-| Reward rising but Pass@1 flat | Possible reward hacking (hardcoded outputs) | Inspect generated code samples |
-| Loss explodes | Learning rate too high | Reduce to 1e-5 |
-| All groups degenerate | G too small or difficulty too uniform | Increase G or diversify dataset |
-| Sandbox timeouts dominating | Code has infinite loops or excessive recursion | Reduce `reward_timeout`, this is normal early on |
+| Signal                        | Diagnosis                                      | Remedy                                           |
+| ----------------------------- | ---------------------------------------------- | ------------------------------------------------ |
+| Reward flat at 0              | Problems too hard; no positive signal          | Filter easier problems, increase G               |
+| Reward flat at 1              | Too easy; model already solves everything      | Use harder subset                                |
+| Format rate dropping          | Model degenerating                             | Check renderer config, reduce learning rate      |
+| Reward rising but Pass@1 flat | Possible reward hacking (hardcoded outputs)    | Inspect generated code samples                   |
+| Loss explodes                 | Learning rate too high                         | Reduce to 1e-5                                   |
+| All groups degenerate         | G too small or difficulty too uniform          | Increase G or diversify dataset                  |
+| Sandbox timeouts dominating   | Code has infinite loops or excessive recursion | Reduce `reward_timeout`, this is normal early on |
 
 ### Log File Interpretation
 
@@ -478,3 +483,23 @@ If you don't see these patterns, something is wrong. See Section 9 for diagnosti
 **Get sequential working first.** Pipeline overlap, advanced concurrency tuning, and latency hiding are Level 2 optimizations. The sequential version validates correctness and gives a baseline to measure speedups against.
 
 **Use the utilities.** Everything in `tinker_utils/` is battle-tested. Don't reimplement prompt construction, test execution, or checkpoint management. Wire the existing pieces together.
+
+intrepretation of results from smoke test:
+The pipeline is working end-to-end! Here's what the two steps tell us:
+
+Step 0 — Solid first step:
+
+format_rate: 99.2% — almost all completions used correct markdown code fences
+mean_correct: 64.8% — the base model already solves ~65% of problems correctly
+5/8 groups skipped — those groups were degenerate (all 16 completions got the same reward), so no gradient signal
+48 datums trained on from the 3 non-degenerate groups
+Step 1 — All degenerate:
+
+format_rate: 100%, mean_correct: 0% — all 128 completions formatted correctly but none passed tests
+8/8 groups skipped — every group was all-zeros, so no training happened (this is expected occasionally with hard problems)
+This is healthy early behavior. The high degenerate rate (5/8 and 8/8) is common at the start — GRPO only learns from groups with variance in outcomes. As training progresses, the model will start solving some problems partially, creating more useful gradient signal.
+
+You're ready for a real training run now. Something like:
+
+uv run python train.py max_steps=100 eval_every=10 save_every=10
+This will give you ~10 eval checkpoints to see if pass@1 improves over time.

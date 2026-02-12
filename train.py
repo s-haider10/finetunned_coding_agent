@@ -6,7 +6,10 @@ import numpy as np
 import chz
 import datasets
 import tinker
+from dotenv import load_dotenv
 from typing import cast, Any
+
+load_dotenv()
 
 from tinker_utils.data import build_question
 from tinker_utils.env import CodeEnv
@@ -43,7 +46,7 @@ class Config:
 
 def _get_tests(example: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract and normalize test cases from a dataset example."""
-    raw = example.get("test_cases") or example.get("input_output")
+    raw = example.get("test_cases") or example.get("input_output") or example.get("tests")
     metadata = example.get("metadata", {})
     if isinstance(metadata, str):
         import json as _json
@@ -177,36 +180,33 @@ def main(config: Config):
     while step < max_steps:
         logger.info(f"=== Step {step} ===")
 
-        # 1. Select prompts
-        batch_examples = []
-        for _ in range(config.group_size):
-            example = train_dataset[idx % n_train]
-            batch_examples.append(example)
-            idx += 1
-
-        # 2. Build model inputs and extract test cases
+        # 1. Select prompts — skip individual bad examples instead of failing entire batch
         model_inputs = []
         batch_tests = []
-        skip_batch = False
-        for example in batch_examples:
+        attempts = 0
+        max_attempts = config.group_size * 10  # safety limit
+
+        while len(model_inputs) < config.group_size and attempts < max_attempts:
+            example = train_dataset[idx % n_train]
+            idx += 1
+            attempts += 1
+
             question = build_question(example)
             if question is None:
-                logger.warning(f"Skipping example at idx {idx}: no valid question")
-                skip_batch = True
-                break
+                logger.debug(f"Skipping example at idx {idx - 1}: no valid question")
+                continue
             tests = _get_tests(example)
             if not tests:
-                logger.warning(f"Skipping example at idx {idx}: no valid tests")
-                skip_batch = True
-                break
-            messages = [
-                Message(role="user", content=question),
-            ]
+                logger.debug(f"Skipping example at idx {idx - 1}: no valid tests")
+                continue
+
+            messages = [Message(role="user", content=question)]
             mi = renderer.build_generation_prompt(messages)
             model_inputs.append(mi)
             batch_tests.append(tests)
 
-        if skip_batch:
+        if len(model_inputs) < config.group_size:
+            logger.warning(f"Could only find {len(model_inputs)}/{config.group_size} valid examples after {max_attempts} attempts, skipping step")
             continue
 
         # 3. Sync weights and get sampling client
