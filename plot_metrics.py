@@ -107,13 +107,14 @@ def plot(rows: list[dict], path: str):
     ax.set_ylim(-0.05, 1.05)
     ax.grid(True, alpha=0.3)
 
-    # 2. Loss
+    # 2. Loss (symlog scale so spikes don't crush normal-range values)
     ax = axes[0, 1]
     loss_vals = [r.get("loss:sum") for r in rows]
     if any(v is not None for v in loss_vals):
         valid = [(s, v) for s, v in zip(steps, loss_vals) if v is not None]
         ax.plot([s for s, _ in valid], [v for _, v in valid], "r-o", markersize=3)
-    ax.set_ylabel("Loss (sum)")
+    ax.set_yscale("symlog", linthresh=1e3)
+    ax.set_ylabel("Loss (sum, symlog)")
     ax.set_title("Training Loss")
     ax.grid(True, alpha=0.3)
 

@@ -592,3 +592,123 @@ Save every:       10 steps
 - Logprobs: ~15-25s (for ~64 non-degenerate completions)
 - Training: ~7s (includes next-step prompt pre-selection)
 - **Total: ~290s/step → ~16 hours for 200 steps**
+
+---
+
+## 12. Run 1: Binary Rewards (100 Steps)
+
+Run directory: `~/code-rl-logs/2026_02_13-06_30_15/`
+
+### Configuration
+
+Exactly as described in Section 11's Final Configuration Summary. Binary rewards (`r_correct ∈ {0, 1}`), 8 groups × 16 completions, lr=5e-6, grad_clip_norm=1.0, weight_decay=0.1. Stopped after step 100 (with eval + checkpoint) because eval was flat.
+
+### Evaluation Results
+
+10 eval checkpoints on a fixed 20-problem held-out set (codeforces + lcbv5 test splits), temperature=0:
+
+```
+step:   10    20    30    40    50    60    70    80    90   100
+p@1:  .350  .250  .300  .300  .300  .350  .300  .350  .250  .300
+fmt:  .950  .950  .900 1.00  .950  .950  .950  .950 1.00   .950
+```
+
+**Mean eval/pass_at_1 = 0.305, std = 0.033.** No trend. With 20 problems, each flip = ±5%, so the full 0.25–0.35 range is consistent with noise around a fixed baseline of ~0.30. The model did not measurably improve on held-out problems.
+
+Eval format rate held steady at 0.95 ± 0.03 — the model maintained proper code fence formatting throughout training.
+
+### Training Metrics Summary
+
+Aggregated across 101 training steps (step 0 through step 100):
+
+| Metric | Min | Max | Mean | Notes |
+|--------|-----|-----|------|-------|
+| mean_correct | 0.031 | 0.727 | 0.383 | Problem difficulty variance, not learning |
+| format_rate | 0.797 | 1.000 | 0.960 | Stable — model never collapsed |
+| n_datums | 32 | 128 | 69.2 | Total: 6,992 datums trained |
+| groups_skipped | 0 | 6 | 3.7 | 46% degenerate rate (3.7/8 groups) |
+| loss:sum | -11,094 | 6.08×10¹¹ | — | Single spike at step 92, otherwise ±10⁴ |
+
+**Total datums trained: 6,992** out of a theoretical maximum of 12,928 (101 steps × 128). The 46% degenerate rate meant nearly half the batch provided zero gradient signal at every step.
+
+### Loss Spike at Step 92
+
+A single catastrophic loss spike: `loss:sum = 6.08×10¹¹` at step 92. All other steps had loss in the range [-11,094, +10,000].
+
+**Root cause**: The importance sampling weight `exp(log π_θ - log q)` exploded. After 92 steps of gradient updates, the current policy `π_θ` diverged far enough from the reference policy `q` (captured at that step's sampling) that the ratio blew up for some completions. Grad clipping at 1.0 capped the gradient norm but could not prevent the loss spike itself — the damage was done in the forward pass.
+
+**Impact**: The model recovered immediately. Step 93 loss was back to normal range, and eval at step 100 showed pass@1=0.300, format=0.950 — consistent with pre-spike performance. The LoRA adapter weights were not permanently damaged. However, the spike confirms that importance sampling without ratio clipping (PPO-style `clip(r, 1-ε, 1+ε)`) is vulnerable to policy drift.
+
+### Timing Profile
+
+| Phase | Min | Max | Mean | % of step |
+|-------|-----|-----|------|-----------|
+| time/sample_s | 63.3s | 620.6s | 211.1s | 80.3% |
+| time/score_s | 10.2s | 243.1s | 29.7s | 11.3% |
+| time/logprobs_s | 3.6s | 27.1s | 11.9s | 4.5% |
+| time/train_s | 2.7s | 16.5s | 7.2s | 2.7% |
+| **time/step_s** | **94.3s** | **654.4s** | **262.8s** | **100%** |
+
+**Total wall-clock time: 7.4 hours** for 101 steps.
+
+Sampling dominated at 80% of step time, as expected. The wide min/max range (63s–621s) reflects Tinker's sampling infrastructure variability — early steps were slower as the service warmed up, with step times decreasing from ~317s to ~150s over the run.
+
+Score time outliers (up to 243s) were caused by sandbox contention when many completions had valid code to execute. The `SANDBOX_MAX_CONCURRENCY=16` setting helped but didn't eliminate occasional backpressure.
+
+### Diagnosis: Why No Improvement
+
+The pipeline is wired correctly — GRPO advantages, importance sampling loss, deferred logprobs, degenerate filtering, checkpoint resume all function as designed. The model didn't collapse (format rate stable, no reward hacking). But eval/pass_at_1 was flat.
+
+**Primary cause: binary rewards with high degenerate rate.**
+
+With `r_correct ∈ {0, 1}`, each group of 16 completions has one of three outcomes:
+1. All fail (reward = 0 for all 16) → degenerate, skipped
+2. All pass (reward = 1 for all 16) → degenerate, skipped
+3. Mixed (some pass, some fail) → non-degenerate, trained on
+
+Only case 3 produces gradient signal, and even then the advantages are coarse: +0.X for passing completions, -0.X for failing ones. A completion that passes 4/5 tests gets the same reward (0.0) as one that produces garbage — the model cannot learn *which direction* to improve.
+
+The 46% degenerate rate (3.7/8 groups skipped per step) means only ~4.3 groups contributed per step. With 16 completions each, that's ~69 datums per step — below the configured batch_size of 128. The effective learning rate per datum is higher than intended, adding noise.
+
+| Factor | Impact | Evidence |
+|--------|--------|----------|
+| Binary rewards | **HIGH** | 46% degenerate groups, no partial credit for near-misses |
+| Small effective batch | **MEDIUM** | Only 69/128 datums per step on average |
+| Static 20-problem eval | **LOW** | Noisy but 10 data points with zero trend is conclusive |
+| Importance weight explosion | **LOW** | Single spike at step 92, model recovered |
+
+### What Run 1 Validated
+
+Despite flat eval, Run 1 was not wasted. It confirmed:
+
+1. **Pipeline correctness** — All components work end-to-end: sampling, scoring, logprobs, advantage computation, datum construction, forward/backward, optimizer step, checkpointing, and resume
+2. **No model collapse** — Format rate stayed at ~96%, training mean_correct averaged 38.3%. The model maintained its base capabilities throughout 100 steps of RL
+3. **Hyperparameter stability** — lr=5e-6 with grad_clip_norm=1.0 and weight_decay=0.1 produced stable training (except the single loss spike). No catastrophic forgetting, no reward hacking
+4. **Cost profile** — 7.4 hours for 100 steps establishes the budget for future runs. Sampling at 80% is the bottleneck
+5. **Baseline** — eval/pass_at_1 ≈ 0.30 is the base model's capability on this eval set. Any future run must beat this to show improvement
+
+---
+
+## 13. Run 2 Plan: Fractional Rewards
+
+The single highest-impact change: replace binary correctness scoring with **fractional test-case rewards**.
+
+**Current (Run 1):**
+```
+correctness = 1.0 if ALL tests pass, else 0.0
+```
+
+**Proposed (Run 2):**
+```
+correctness = tests_passed / total_tests
+```
+
+**Why this matters:**
+1. A solution passing 4/5 tests gets 0.8 instead of 0.0 — the model learns *which direction* to improve
+2. Far fewer degenerate groups: even when no completion passes all tests, partial scores create advantage variance
+3. More datums per step → stronger gradient signal → faster learning
+4. Aligns with DAPO / Dr. GRPO findings that dense rewards improve GRPO convergence
+
+**Additional changes for Run 2:**
+- Larger eval set: 50–100 problems, randomly sampled each eval, for reliable metrics
+- Fresh start from base model (changing the reward function invalidates Run 1's optimizer state)

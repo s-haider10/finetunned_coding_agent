@@ -61,6 +61,9 @@ def _get_tests(example: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def main(config: Config):
+    # Expand ~ in log_path so checkpoint.py and other utils get an absolute path
+    config = chz.replace(config, log_path=os.path.expanduser(config.log_path))
+
     # Increase sandbox concurrency (default is 4, too low for 128 completions)
     os.environ.setdefault("SANDBOX_MAX_CONCURRENCY", "16")
 
