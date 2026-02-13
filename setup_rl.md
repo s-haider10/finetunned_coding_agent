@@ -187,20 +187,20 @@ The prompt flows through three stages:
 
 The `Config` class (managed via `chz`) controls all hyperparameters:
 
-| Parameter        | Default                       | Meaning                                                           |
-| ---------------- | ----------------------------- | ----------------------------------------------------------------- |
-| `model_name`     | `Qwen/Qwen3-4B-Instruct-2507` | Base model for LoRA fine-tuning                                   |
-| `batch_size`     | 128                           | Total completions per training step                               |
-| `group_size`     | 8                             | Prompts per batch (so 128/8 = 16 completions per prompt)          |
-| `learning_rate`  | 4e-5                          | Adam LR (~10x higher than full fine-tuning, appropriate for LoRA) |
-| `lora_rank`      | 32                            | LoRA adapter dimension                                            |
-| `max_tokens`     | 24576                         | Max generation length in tokens                                   |
-| `temperature`    | 1.0                           | Sampling temperature (high entropy for exploration)               |
-| `format_coef`    | 0.1                           | Weight for format reward component                                |
-| `reward_timeout` | 6                             | Sandbox timeout per test case (seconds)                           |
-| `save_every`     | 10                            | Checkpoint frequency (0 = disabled)                               |
-| `eval_every`     | 10                            | Evaluation frequency (-1 = disabled)                              |
-| `max_steps`      | -1                            | Training steps (-1 = unlimited)                                   |
+| Parameter        | Default                        | Meaning                                                            |
+| ---------------- | ------------------------------ | ------------------------------------------------------------------ |
+| `model_name`     | `Qwen/Qwen3-4B-Instruct-2507` | Base model for LoRA fine-tuning                                    |
+| `batch_size`     | 128                            | Total completions per training step                                |
+| `group_size`     | 8                              | Prompts per batch (so 128/8 = 16 completions per prompt)           |
+| `learning_rate`  | 5e-6                           | Adam LR (tuned low for G=8 variance, see Section 11)               |
+| `lora_rank`      | 32                             | LoRA adapter dimension                                             |
+| `max_tokens`     | 8192                           | Max generation length in tokens                                    |
+| `temperature`    | 1.0                            | Sampling temperature (high entropy for exploration)                |
+| `format_coef`    | 0.1                            | Weight for format reward component                                 |
+| `reward_timeout` | 6                              | Sandbox timeout per test case (seconds)                            |
+| `save_every`     | 10                             | Checkpoint frequency (0 = disabled)                                |
+| `eval_every`     | 10                             | Evaluation frequency (-1 = disabled)                               |
+| `max_steps`      | 200                            | Training steps (-1 = unlimited)                                    |
 
 **Derived value:** `completions_per_prompt = batch_size // group_size = 16` -- this is the G in GRPO terminology.
 
@@ -239,7 +239,7 @@ For each training step:
 
 3. **Sync weights** -- Call `training_client.save_weights_and_get_sampling_client()` to create a fresh sampling client with the latest LoRA weights. This is critical -- Tinker docs warn about sampler desync if you skip this step.
 
-4. **Sample completions** -- For each prompt, fire `sample_async()` requesting `completions_per_prompt` (16) samples at temperature 1.0 with `max_tokens=24576`. Use `asyncio.gather()` to run all 8 prompts concurrently. Each result returns token IDs and per-token log-probabilities.
+4. **Sample completions** -- For each prompt, fire `sample_async()` requesting `completions_per_prompt` (16) samples at temperature 1.0 with `max_tokens=8192`. Use `asyncio.gather()` to run all 8 prompts concurrently. Each result returns token IDs and per-token log-probabilities.
 
 5. **Score completions** -- For each of the 128 completions, extract code and evaluate:
    - Parse the model output to text, extract the last fenced code block
@@ -249,18 +249,23 @@ For each training step:
    - Total reward: `0.1 * format_score + correctness_score`
    - Use `asyncio.gather()` for concurrent sandbox calls (connection pool handles backpressure)
 
-6. **Compute advantages** -- For each group of 16 completions:
+6. **Compute advantages & filter** -- For each group of 16 completions:
    - Calculate advantage for each completion: `A_g = R_g - mean(rewards)`
    - If all advantages are zero (degenerate group), skip the entire group
+   - Collect non-degenerate `(global_index, advantage)` pairs
 
-7. **Build training datums** -- For each non-skipped completion, construct a `tinker.types.Datum` with:
+6b. **Compute reference logprobs** -- Only for non-degenerate completions (cost optimization):
+   - Call `compute_logprobs_async()` on each surviving completion's full (prompt+completion) sequence
+   - This typically halves the logprob compute vs. computing for all 128 upfront (~50% of groups are degenerate)
+
+7. **Build training datums** -- For each non-degenerate completion, construct a `tinker.types.Datum` with:
    - Shifted token alignment (input_ids = tokens[:-1], target_ids = tokens[1:])
-   - Per-token logprobs from the sampler (zero on prompt positions)
+   - Per-token reference logprobs from the sampling policy (zero on prompt positions)
    - Per-token advantages (zero on prompt, scalar advantage on completion tokens)
 
 8. **Train** -- If there are any datums, submit `forward_backward()` with `"importance_sampling"` loss, then `optim_step()` with Adam parameters. Both calls return `APIFuture` objects -- submit back-to-back (Tinker best practice), then wait on both.
 
-9. **Log metrics** -- Record mean_reward, mean_correct, format_rate, groups_skipped, n_datums, loss.
+9. **Log metrics** -- Record mean_reward, mean_correct, format_rate, groups_skipped, n_datums, loss, and per-phase timing (time/step_s, time/sync_s, time/sample_s, time/score_s, time/logprobs_s, time/train_s).
 
 10. **Evaluate** -- Every `eval_every` steps, run Pass@1 on the held-out test set with temperature=0.
 
@@ -305,15 +310,15 @@ main(config):
 ### AdamParams
 
 ```
-learning_rate = config.learning_rate  (4e-5)
+learning_rate = config.learning_rate  (5e-6)
 beta1 = 0.9      (Tinker default)
 beta2 = 0.95     (Tinker default)
-eps = 1e-12       (Tinker default)
-weight_decay = 0.0
-grad_clip_norm = 0.0
+eps = 1e-12      (Tinker default)
+weight_decay = 0.1
+grad_clip_norm = 1.0
 ```
 
-The 4e-5 learning rate is ~10x higher than typical full fine-tuning rates, which is appropriate for LoRA since only the low-rank adapter matrices are updated.
+The 5e-6 learning rate is conservative for G=8 GRPO — with only 16 completions per prompt, gradient variance is ~8x higher than a G=64 setup (like DeepSeekMath), requiring a proportionally lower LR. Grad clipping at 1.0 prevents catastrophic updates from high-variance groups. Weight decay at 0.1 is standard regularization. See Section 11 for the full derivation.
 
 ---
 
@@ -358,19 +363,14 @@ For each well-formatted completion, Sandbox Fusion evaluates correctness:
 
 ## 7. Optimizations & Performance
 
-### Level 1: Sequential Pipeline (Start Here)
+### Pipeline Architecture (Current)
 
-Get the basic loop working first: sample -> score -> train, one stage at a time. This is correct, simple to debug, and validates the full pipeline before optimizing.
+The loop runs: **sync → sample → score → logprobs → train** sequentially, with one overlap optimization:
 
-### Level 2: Pipeline Overlap
+- **Prompt pre-selection**: While the GPU is busy with `forward_backward` + `optim_step`, the next step's prompts are selected and tokenized on the CPU. This hides prompt-selection latency inside the train phase.
+- **Deferred logprobs**: Reference logprobs are computed only after scoring identifies non-degenerate completions, saving ~40-50% of logprob prefill cost (see below).
 
-Once the sequential version works, overlap stages for better GPU utilization:
-
-- While training on batch N, start sampling batch N+1
-- While scoring batch N, the GPU is idle anyway -- use it for sampling
-- Effective step time becomes `max(t_sample, t_score, t_train)` instead of the sum
-
-This yields ~2-3x speedup but adds complexity around weight sync timing and async coordination.
+Sampling dominates wall-clock time (~85% of each step). Further pipeline overlap (sampling batch N+1 during training batch N) was considered but adds weight-sync complexity for marginal gain given the sampling bottleneck.
 
 ### Sandbox Concurrency
 
@@ -386,15 +386,22 @@ export SANDBOX_MAX_CONCURRENCY="16"
 
 The reward pipeline has a built-in early exit: if code extraction fails (no valid fenced block), the completion is immediately scored -0.1 and the sandbox call is skipped. This avoids wasting sandbox resources on obviously bad outputs.
 
+### Deferred Logprobs (Cost Optimization)
+
+An earlier version computed reference logprobs for all 128 completions in parallel with scoring ("speculative logprobs"). This wasted ~50% of Tinker's sampler prefill tokens on degenerate groups whose logprobs are never used.
+
+The current approach: **score first, then compute logprobs only for non-degenerate completions**. With ~50% degenerate groups typical in early training, this cuts logprob prefill from ~128 to ~64 calls per step — saving ~40% of total prefill cost with negligible wall-clock impact (logprob compute is fast relative to sampling).
+
 ### Degenerate Group Skipping
 
 When `should_skip()` returns True for a group (all advantages zero), we avoid:
 
+- Computing reference logprobs for those completions (saves prefill tokens)
 - Building `Datum` objects (saves CPU + memory allocation)
 - The `forward_backward()` call for those datums (saves GPU)
 - The `optim_step()` if ALL groups are degenerate (saves GPU entirely)
 
-Early in training, expect 30-50% of groups to be degenerate (too hard for the base model). As the model improves, this rate should decrease.
+Early in training, expect 30-50% of groups to be degenerate (too hard for the base model). As the model improves on easy problems, degenerate rate may actually increase (all-pass groups) — this is a convergence signal.
 
 ### Connection Pool Reuse
 
@@ -406,14 +413,20 @@ The sandbox session in `env.py` is a singleton `aiohttp.ClientSession` -- it's c
 
 ### Online Metrics (Every Step)
 
-| Metric           | What It Measures                                                    |
-| ---------------- | ------------------------------------------------------------------- |
-| `mean_reward`    | Average R across all 128 completions in the batch                   |
-| `mean_correct`   | Fraction with correctness_score = 1 (approximate train-time Pass@1) |
-| `format_rate`    | Fraction with valid code fences                                     |
-| `groups_skipped` | How many of the 8 groups were degenerate                            |
-| `groups_total`   | Total groups (always 8)                                             |
-| `n_datums`       | Number of non-degenerate training datums                            |
+| Metric             | What It Measures                                                    |
+| ------------------ | ------------------------------------------------------------------- |
+| `mean_reward`      | Average R across all 128 completions in the batch                   |
+| `mean_correct`     | Fraction with correctness_score = 1 (approximate train-time Pass@1) |
+| `format_rate`      | Fraction with valid code fences                                     |
+| `groups_skipped`   | How many of the 8 groups were degenerate                            |
+| `groups_total`     | Total groups (always 8)                                             |
+| `n_datums`         | Number of non-degenerate training datums                            |
+| `time/step_s`      | Total wall-clock time for the step                                  |
+| `time/sync_s`      | Weight sync (save_weights_and_get_sampling_client)                  |
+| `time/sample_s`    | Sampling all 128 completions                                        |
+| `time/score_s`     | Sandbox scoring all completions                                     |
+| `time/logprobs_s`  | Reference logprob computation (non-degenerate only)                 |
+| `time/train_s`     | forward_backward + optim_step + next prompt selection               |
 
 ### Periodic Evaluation (Every `eval_every` Steps)
 
@@ -484,22 +497,98 @@ If you don't see these patterns, something is wrong. See Section 9 for diagnosti
 
 **Use the utilities.** Everything in `tinker_utils/` is battle-tested. Don't reimplement prompt construction, test execution, or checkpoint management. Wire the existing pieces together.
 
-intrepretation of results from smoke test:
-The pipeline is working end-to-end! Here's what the two steps tell us:
+### Running
 
-Step 0 — Solid first step:
+```bash
+caffeinate -s uv run python train.py
+```
 
-format_rate: 99.2% — almost all completions used correct markdown code fences
-mean_correct: 64.8% — the base model already solves ~65% of problems correctly
-5/8 groups skipped — those groups were degenerate (all 16 completions got the same reward), so no gradient signal
-48 datums trained on from the 3 non-degenerate groups
-Step 1 — All degenerate:
+The `caffeinate -s` prevents macOS sleep — critical since the laptop orchestrates all remote Tinker API calls. If the laptop sleeps mid-step, the sampling/training calls will timeout and the step is lost.
 
-format_rate: 100%, mean_correct: 0% — all 128 completions formatted correctly but none passed tests
-8/8 groups skipped — every group was all-zeros, so no training happened (this is expected occasionally with hard problems)
-This is healthy early behavior. The high degenerate rate (5/8 and 8/8) is common at the start — GRPO only learns from groups with variance in outcomes. As training progresses, the model will start solving some problems partially, creating more useful gradient signal.
+Monitor progress with:
 
-You're ready for a real training run now. Something like:
+```bash
+uv run python plot_metrics.py
+```
 
-uv run python train.py max_steps=100 eval_every=10 save_every=10
-This will give you ~10 eval checkpoints to see if pass@1 improves over time.
+This auto-finds the latest run in `~/code-rl-logs/` and displays a text summary with trend arrows plus a 4-panel matplotlib plot (pass rate, loss, datums, groups skipped).
+
+---
+
+## 11. Development Journey: How We Got Here
+
+This section documents the key bugs, optimizations, and hyperparameter decisions made during development, and the reasoning behind each change.
+
+### Bug Fixes (v0 → v1)
+
+**Bug 1: Missing logprobs.** The initial implementation passed zero logprobs for all tokens. With `importance_sampling` loss, the importance weight `exp(log π_θ - log q)` was computed against fake zeros, producing meaningless gradients. **Fix**: Call `compute_logprobs_async()` on the sampling client to get actual reference logprobs from the sampling policy.
+
+**Bug 2: asyncio session dying.** Using `asyncio.run()` for each phase (sample, score) created and destroyed a new event loop each time. The `aiohttp.ClientSession` in `env.py` is a module-level singleton — when the first loop closed, the session was invalidated. Subsequent scoring calls failed silently or raised `RuntimeError`. **Fix**: Create a single persistent `asyncio.new_event_loop()` at the start and reuse it for all `loop.run_until_complete()` calls.
+
+**Bug 3: No epoch reshuffling.** When the dataset index wrapped around, the same order was used in every epoch, biasing training toward problems at the start of the dataset. **Fix**: Track epoch count and re-shuffle with `seed=42 + epoch` on each wrap-around.
+
+### Cost Optimization: Sequential Logprobs
+
+**Problem**: Computing reference logprobs for all 128 completions in parallel with scoring ("speculative logprobs") wasted ~50% of Tinker's sampler prefill budget on degenerate groups whose logprobs are never used. A 2-step smoke test consumed 2.49M prefill tokens — ~1M of which were wasted on degenerate completions.
+
+**Solution**: Score all completions first, identify non-degenerate groups, then compute logprobs only for surviving completions. With ~50% degenerate groups, this cuts logprob calls from 128 to ~64 per step.
+
+**Trade-off**: Scoring and logprobs now run sequentially instead of in parallel. In practice this adds negligible wall-clock time because logprob computation (~20s) is dwarfed by sampling (~250s), and we're calling half as many logprob requests.
+
+### Hyperparameter Tuning
+
+Each change below was motivated by specific failure modes observed in smoke tests.
+
+#### max_tokens: 24576 → 8192
+
+**Problem**: Sampling dominated step time at 430s/step. The model was generating up to 24K tokens per completion — far more than needed for competitive programming solutions.
+
+**Evidence**: simpleRL-reason uses 8192 for math, Swift-GRPO uses 2048. Code solutions rarely exceed 2000 tokens. The 24K budget was burning time on padding and unnecessary generation.
+
+**Result**: Step time dropped from 460s to 288s (37% reduction) with no observable impact on pass rate.
+
+#### learning_rate: 4e-5 → 5e-6
+
+**Problem**: A 2-step run with real logprobs showed pass rate dropping from 57.8% to 39.8% and loss flipping sign (+9563), indicating catastrophic policy updates.
+
+**Analysis**: With G=8 (16 completions per prompt), gradient variance is ~8x higher than the G=64 setup used by DeepSeekMath (which uses lr=1e-6). The effective gradient noise amplification was estimated at ~80x above DeepSeekMath's regime. Literature review:
+
+| Paper           | G    | LR   | Model Size |
+| --------------- | ---- | ---- | ---------- |
+| DeepSeekMath    | 64   | 1e-6 | 7B         |
+| DAPO            | 16   | 1e-6 | 7-32B      |
+| simpleRL-reason | 8    | 5e-6 | 7B         |
+| **Ours**        | **8**| **5e-6** | **4B** |
+
+The 5e-6 LR matches the simpleRL-reason setting for comparable G and model size.
+
+#### grad_clip_norm: 0.0 → 1.0
+
+With G=8 and importance sampling, individual groups can produce outsized gradients when the advantage magnitude is large and the importance weight `exp(log π - log q)` diverges. Clipping at norm 1.0 prevents single-step catastrophic updates without suppressing the learning signal during normal training.
+
+#### weight_decay: 0.0 → 0.1
+
+Standard regularization. Prevents LoRA adapter weights from growing unboundedly during the 200-step run. The 0.1 value is the default in most LLM training recipes (LLaMA, Qwen pretraining).
+
+### Final Configuration Summary
+
+```
+Model:            Qwen/Qwen3-4B-Instruct-2507
+LoRA rank:        32
+Batch size:       128 (8 groups × 16 completions)
+Learning rate:    5e-6
+Grad clip norm:   1.0
+Weight decay:     0.1
+Max tokens:       8192
+Temperature:      1.0
+Max steps:        200
+Eval every:       10 steps
+Save every:       10 steps
+```
+
+**Expected per-step profile** (from smoke tests):
+- Sampling: ~250s (dominates)
+- Scoring: ~5s
+- Logprobs: ~15-25s (for ~64 non-degenerate completions)
+- Training: ~7s (includes next-step prompt pre-selection)
+- **Total: ~290s/step → ~16 hours for 200 steps**

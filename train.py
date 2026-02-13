@@ -2,6 +2,7 @@ import os
 import asyncio
 import datetime
 import logging
+import time
 import numpy as np
 import chz
 import datasets
@@ -27,21 +28,21 @@ logging.getLogger("httpx").setLevel(logging.WARN)
 class Config:
     base_url: str | None = None
     log_path: str = os.path.join(
-        os.path.expanduser("~/code-rl-logs"),
+        "~/code-rl-logs",
         datetime.datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
     )
     model_name: str = "Qwen/Qwen3-4B-Instruct-2507"
     batch_size: int = 128
     group_size: int = 8
-    learning_rate: float = 4e-5
+    learning_rate: float = 5e-6
     lora_rank: int = 32
     save_every: int = 10  # 0 = disabled
     eval_every: int = 10 # -1 = disabled
-    max_tokens: int = 24576
+    max_tokens: int = 8192
     format_coef: float = 0.1
     reward_timeout: int = 6
     temperature: float = 1.0
-    max_steps: int = -1  # -1 = unlimited
+    max_steps: int = 200  # -1 = unlimited
 
 
 def _get_tests(example: dict[str, Any]) -> list[dict[str, Any]]:
@@ -60,6 +61,9 @@ def _get_tests(example: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def main(config: Config):
+    # Increase sandbox concurrency (default is 4, too low for 128 completions)
+    os.environ.setdefault("SANDBOX_MAX_CONCURRENCY", "16")
+
     # Load dataset
     logger.info("Loading dataset...")
     train_dataset = datasets.concatenate_datasets(
@@ -103,7 +107,11 @@ def main(config: Config):
     )
 
     # Adam params
-    adam_params = tinker.types.AdamParams(learning_rate=config.learning_rate)
+    adam_params = tinker.types.AdamParams(
+        learning_rate=config.learning_rate,
+        grad_clip_norm=1.0,
+        weight_decay=0.1,
+    )
 
     # Sampling params
     sampling_params = tinker.types.SamplingParams(
@@ -141,6 +149,17 @@ def main(config: Config):
         ]
         return await asyncio.gather(*futures)
 
+    async def compute_ref_logprobs(
+        sampling_client: tinker.SamplingClient,
+        full_sequences: list[tinker.ModelInput],
+    ) -> list[list[float | None]]:
+        """Compute reference logprobs for full (prompt+completion) sequences."""
+        futures = [
+            sampling_client.compute_logprobs_async(seq)
+            for seq in full_sequences
+        ]
+        return await asyncio.gather(*futures)
+
     async def score_completion(
         completion_tokens: list[int],
         tests: list[dict[str, Any]],
@@ -170,77 +189,116 @@ def main(config: Config):
         ]
         return await asyncio.gather(*tasks)
 
+    # Create a persistent event loop for all async work (Bug 2 fix:
+    # reusing asyncio.run() kills the aiohttp session in env.py across calls)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     # Main training loop
     step = start_step
     idx = dataset_offset
     n_train = len(train_dataset)
+    epoch = 0
+    next_model_inputs: list[tinker.ModelInput] = []
+    next_batch_tests: list[list[dict[str, Any]]] = []
 
-    logger.info(f"Starting training from step {step}, dataset has {n_train} examples")
-
-    while step < max_steps:
-        logger.info(f"=== Step {step} ===")
-
-        # 1. Select prompts — skip individual bad examples instead of failing entire batch
+    def select_prompts() -> tuple[list[tinker.ModelInput], list[list[dict[str, Any]]]]:
+        """Select group_size valid prompts from the dataset."""
+        nonlocal idx, epoch, train_dataset
         model_inputs = []
         batch_tests = []
         attempts = 0
-        max_attempts = config.group_size * 10  # safety limit
+        max_attempts = config.group_size * 10
 
         while len(model_inputs) < config.group_size and attempts < max_attempts:
-            example = train_dataset[idx % n_train]
+            if idx >= n_train:
+                epoch += 1
+                train_dataset = train_dataset.shuffle(seed=42 + epoch)
+                idx = 0
+                logger.info(f"Epoch {epoch}: reshuffled dataset")
+            example = train_dataset[idx]
             idx += 1
             attempts += 1
 
             question = build_question(example)
             if question is None:
-                logger.debug(f"Skipping example at idx {idx - 1}: no valid question")
                 continue
             tests = _get_tests(example)
             if not tests:
-                logger.debug(f"Skipping example at idx {idx - 1}: no valid tests")
                 continue
-
             messages = [Message(role="user", content=question)]
             mi = renderer.build_generation_prompt(messages)
             model_inputs.append(mi)
             batch_tests.append(tests)
 
+        return model_inputs, batch_tests
+
+    logger.info(f"Starting training from step {step}, dataset has {n_train} examples")
+
+    while step < max_steps:
+        step_start = time.time()
+        logger.info(f"=== Step {step} ===")
+
+        # 1. Use pre-selected prompts if available, otherwise select fresh
+        if next_model_inputs and len(next_model_inputs) == config.group_size:
+            model_inputs = next_model_inputs
+            batch_tests = next_batch_tests
+            next_model_inputs = []
+            next_batch_tests = []
+        else:
+            model_inputs, batch_tests = select_prompts()
+
         if len(model_inputs) < config.group_size:
-            logger.warning(f"Could only find {len(model_inputs)}/{config.group_size} valid examples after {max_attempts} attempts, skipping step")
+            logger.warning(f"Could only find {len(model_inputs)}/{config.group_size} valid examples, skipping step")
             continue
 
         # 3. Sync weights and get sampling client
+        t0 = time.time()
         sampling_client = training_client.save_weights_and_get_sampling_client(
             name=f"step_{step}"
         )
+        time_sync = time.time() - t0
 
         # 4. Sample completions
         logger.info(f"Sampling {config.group_size} x {completions_per_prompt} completions...")
-        sample_results = asyncio.run(sample_batch(sampling_client, model_inputs))
+        t0 = time.time()
+        sample_results = loop.run_until_complete(sample_batch(sampling_client, model_inputs))
+        time_sample = time.time() - t0
 
-        # 5. Score all completions
+        # 5. Build full sequences and score completions
         all_completion_tokens = []
         all_completion_tests = []
+        all_full_sequences = []  # full (prompt+completion) as ModelInput for logprob computation
         ob_lens = []
 
         for prompt_idx, (mi, sr) in enumerate(zip(model_inputs, sample_results)):
             ob_len = mi.length
+            prompt_tokens = list(mi.to_ints())
             for seq in sr.sequences:
                 all_completion_tokens.append(seq.tokens)
                 all_completion_tests.append(batch_tests[prompt_idx])
                 ob_lens.append(ob_len)
+                # Build full sequence for logprob computation
+                full_tokens = prompt_tokens + list(seq.tokens)
+                all_full_sequences.append(
+                    tinker.ModelInput(chunks=[tinker.types.EncodedTextChunk(tokens=full_tokens)])
+                )
 
+        # 5b. Score completions
         logger.info(f"Scoring {len(all_completion_tokens)} completions...")
-        score_results = asyncio.run(
+        t0 = time.time()
+        score_results = loop.run_until_complete(
             score_all_completions(all_completion_tokens, all_completion_tests)
         )
+        time_score = time.time() - t0
 
-        # 6. Compute advantages and build datums
-        datums: list[tinker.types.Datum] = []
+        # 6. Compute advantages, identify non-degenerate completions
         all_rewards = []
         all_formats = []
         all_corrects = []
         groups_skipped = 0
+        # Collect (global_idx, advantage) for non-degenerate completions
+        non_degenerate: list[tuple[int, float]] = []
 
         for g in range(config.group_size):
             start = g * completions_per_prompt
@@ -261,33 +319,59 @@ def main(config: Config):
                 continue
 
             for i in range(completions_per_prompt):
-                global_idx = start + i
-                sr = sample_results[g]
-                seq = sr.sequences[i]
+                non_degenerate.append((start + i, advantages[i]))
 
-                full_tokens = list(model_inputs[g].to_ints()) + list(seq.tokens)
-                logprobs_full = [0.0] * ob_lens[global_idx] + (seq.logprobs or [0.0] * len(seq.tokens))
+        # 6b. Compute ref logprobs only for non-degenerate completions
+        nd_sequences = [all_full_sequences[idx] for idx, _ in non_degenerate]
+        logger.info(f"Computing ref logprobs for {len(nd_sequences)} completions...")
+        t0 = time.time()
+        nd_ref_logprobs = loop.run_until_complete(
+            compute_ref_logprobs(sampling_client, nd_sequences)
+        )
+        time_logprobs = time.time() - t0
 
-                datum = make_datum(
-                    tokens=full_tokens,
-                    logprobs=logprobs_full,
-                    ob_len=ob_lens[global_idx],
-                    advantage=advantages[i],
-                )
-                datums.append(datum)
+        # 6c. Build datums
+        datums: list[tinker.types.Datum] = []
+        for nd_pos, (global_idx, advantage) in enumerate(non_degenerate):
+            logprobs_full = [v if v is not None else 0.0 for v in nd_ref_logprobs[nd_pos]]
+            full_tokens = list(all_full_sequences[global_idx].to_ints())
+            datum = make_datum(
+                tokens=full_tokens,
+                logprobs=logprobs_full,
+                ob_len=ob_lens[global_idx],
+                advantage=advantage,
+            )
+            datums.append(datum)
 
-        # 7. Train
+        # 7. Train — fire futures without blocking, so we can prep next step's prompts
+        t0 = time.time()
         train_metrics: dict[str, float] = {}
+        fwd_future = None
+        opt_future = None
         if datums:
             logger.info(f"Training on {len(datums)} datums ({groups_skipped}/{config.group_size} groups skipped)...")
-            train_metrics = train_step(training_client, datums, adam_params)
+            fwd_future = training_client.forward_backward(datums, "importance_sampling")
+            opt_future = training_client.optim_step(adam_params)
         else:
             logger.warning("All groups degenerate, skipping train step")
+
+        # 7b. While GPU is busy with forward/backward + optim, pre-select next step's prompts
+        if step + 1 < max_steps:
+            next_model_inputs, next_batch_tests = select_prompts()
+
+        # 7c. Now wait for training to finish
+        if fwd_future is not None:
+            fwd_result = fwd_future.result()
+            opt_future.result()
+            train_metrics = fwd_result.metrics
+        time_train = time.time() - t0
 
         # 8. Log metrics
         mean_reward = sum(all_rewards) / len(all_rewards) if all_rewards else 0.0
         format_rate = sum(1 for f in all_formats if f >= 0) / len(all_formats) if all_formats else 0.0
         mean_correct = sum(all_corrects) / len(all_corrects) if all_corrects else 0.0
+
+        time_step = time.time() - step_start
 
         metrics = {
             "mean_reward": mean_reward,
@@ -296,6 +380,12 @@ def main(config: Config):
             "groups_skipped": groups_skipped,
             "groups_total": config.group_size,
             "n_datums": len(datums),
+            "time/step_s": round(time_step, 1),
+            "time/sync_s": round(time_sync, 1),
+            "time/sample_s": round(time_sample, 1),
+            "time/score_s": round(time_score, 1),
+            "time/logprobs_s": round(time_logprobs, 1),
+            "time/train_s": round(time_train, 1),
             **train_metrics,
         }
         ml_logger.log_metrics(metrics, step=step)
@@ -346,7 +436,7 @@ def main(config: Config):
 
                 return await score_all_completions(eval_tokens, eval_tests_flat)
 
-            eval_scores = asyncio.run(run_eval())
+            eval_scores = loop.run_until_complete(run_eval())
             if eval_scores:
                 eval_correct = sum(s["correct"] for s in eval_scores) / len(eval_scores)
                 eval_format = sum(1 for s in eval_scores if s["format"] >= 0) / len(eval_scores)
@@ -371,6 +461,7 @@ def main(config: Config):
 
         step += 1
 
+    loop.close()
     logger.info("Training complete.")
     ml_logger.close()
 
@@ -413,18 +504,6 @@ def make_datum(
             "advantages": adv,
         },
     )
-
-
-def train_step(
-    training_client: tinker.TrainingClient,
-    datums: list[tinker.types.Datum],
-    adam_params: tinker.types.AdamParams
-) -> dict[str, float]:
-    fwd_future = training_client.forward_backward(datums, "importance_sampling")
-    opt_future = training_client.optim_step(adam_params)
-    fwd_result = fwd_future.result()
-    opt_future.result()
-    return fwd_result.metrics
 
 
 if __name__ == "__main__":
