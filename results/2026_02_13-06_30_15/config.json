@@ -1,0 +1,16 @@
+{
+  "base_url": null,
+  "log_path": "/Users/syedalihaider/code-rl-logs/2026_02_13-06_30_15",
+  "model_name": "Qwen/Qwen3-4B-Instruct-2507",
+  "batch_size": 128,
+  "group_size": 8,
+  "learning_rate": 5e-06,
+  "lora_rank": 32,
+  "save_every": 10,
+  "eval_every": 10,
+  "max_tokens": 8192,
+  "format_coef": 0.1,
+  "reward_timeout": 6,
+  "temperature": 1.0,
+  "max_steps": 200
+}

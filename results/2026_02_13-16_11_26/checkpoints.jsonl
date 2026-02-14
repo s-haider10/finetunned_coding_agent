@@ -1,0 +1,4 @@
+{"name": "step_10", "step": 10, "dataset_offset": 96, "state_path": "tinker://386b5793-9e68-5081-91c8-78e0c81b4f66:train:0/weights/step_10", "sampler_path": "tinker://386b5793-9e68-5081-91c8-78e0c81b4f66:train:0/sampler_weights/step_10"}
+{"name": "step_20", "step": 20, "dataset_offset": 176, "state_path": "tinker://386b5793-9e68-5081-91c8-78e0c81b4f66:train:0/weights/step_20", "sampler_path": "tinker://386b5793-9e68-5081-91c8-78e0c81b4f66:train:0/sampler_weights/step_20"}
+{"name": "step_30", "step": 30, "dataset_offset": 256, "state_path": "tinker://386b5793-9e68-5081-91c8-78e0c81b4f66:train:0/weights/step_30", "sampler_path": "tinker://386b5793-9e68-5081-91c8-78e0c81b4f66:train:0/sampler_weights/step_30"}
+{"name": "step_40", "step": 40, "dataset_offset": 336, "state_path": "tinker://386b5793-9e68-5081-91c8-78e0c81b4f66:train:0/weights/step_40", "sampler_path": "tinker://386b5793-9e68-5081-91c8-78e0c81b4f66:train:0/sampler_weights/step_40"}
