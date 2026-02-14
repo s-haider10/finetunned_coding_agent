@@ -1,4 +1,6 @@
 import os
+import re
+import random
 import asyncio
 import datetime
 import logging
@@ -13,9 +15,9 @@ from typing import cast, Any
 load_dotenv()
 
 from tinker_utils.data import build_question
-from tinker_utils.env import CodeEnv
+from tinker_utils.env import CodeEnv, sandbox_check_correctness_fractional
 from tinker_utils.lcb import normalize_tests
-from tinker_utils.renderers import get_renderer, Message
+from tinker_utils.renderers import get_renderer, get_text_content, Message
 from tinker_utils.log import setup_logging
 from tinker_utils.checkpoint import save_checkpoint, get_last_checkpoint
 
@@ -42,7 +44,8 @@ class Config:
     format_coef: float = 0.1
     reward_timeout: int = 6
     temperature: float = 1.0
-    max_steps: int = 200  # -1 = unlimited
+    max_steps: int = 50  # -1 = unlimited
+    fractional_rewards: bool = True  # Run 2: tests_passed/total_tests instead of binary
 
 
 def _get_tests(example: dict[str, Any]) -> list[dict[str, Any]]:
@@ -167,20 +170,51 @@ def main(config: Config):
         completion_tokens: list[int],
         tests: list[dict[str, Any]],
     ) -> dict[str, float]:
-        """Score a single completion using the CodeEnv."""
-        env = CodeEnv(
-            problem="",
-            tests=tests,
-            renderer=renderer,
-            format_coef=config.format_coef,
-            reward_timeout=config.reward_timeout,
-        )
-        result = await env.step(completion_tokens)
-        return {
-            "reward": result.reward,
-            "format": result.metrics.get("format", 0.0),
-            "correct": result.metrics.get("correct", 0.0),
-        }
+        """Score a single completion.
+
+        When fractional_rewards=True (Run 2), extract code inline and call
+        sandbox_check_correctness_fractional for dense gradient signal.
+        When False (Run 1), use the CodeEnv binary path.
+        """
+        if config.fractional_rewards:
+            # --- Run 2: fractional scoring ---
+            message, parse_success = renderer.parse_response(completion_tokens)
+            content = get_text_content(message)
+            # Same regex as CodeEnv.extract_code_from_model
+            code_blocks = re.findall(r"```(?:\w+)?\n(.*?)```", content, re.DOTALL)
+            code = code_blocks[-1].strip() if code_blocks else None
+
+            format_ok = bool(parse_success) and code is not None
+            format_score = 0.0 if format_ok else -1.0
+
+            if code is None:
+                correct_score = 0.0
+            else:
+                correct_score, _ = await sandbox_check_correctness_fractional(
+                    tests, code, timeout=config.reward_timeout
+                )
+
+            total_reward = (config.format_coef * format_score) + correct_score
+            return {
+                "reward": total_reward,
+                "format": format_score,
+                "correct": correct_score,
+            }
+        else:
+            # --- Run 1: binary scoring via CodeEnv ---
+            env = CodeEnv(
+                problem="",
+                tests=tests,
+                renderer=renderer,
+                format_coef=config.format_coef,
+                reward_timeout=config.reward_timeout,
+            )
+            result = await env.step(completion_tokens)
+            return {
+                "reward": result.reward,
+                "format": result.metrics.get("format", 0.0),
+                "correct": result.metrics.get("correct", 0.0),
+            }
 
     async def score_all_completions(
         all_tokens: list[list[int]],
@@ -405,8 +439,15 @@ def main(config: Config):
                 stop=renderer.get_stop_sequences(),
             )
 
-            n_eval = min(20, len(test_dataset))
-            eval_examples = [test_dataset[i] for i in range(n_eval)]
+            # Run 1: fixed first 20 problems
+            # n_eval = min(20, len(test_dataset))
+            # eval_examples = [test_dataset[i] for i in range(n_eval)]
+
+            # Run 2: 50 randomly-sampled problems (step-seeded for reproducibility)
+            n_eval = min(50, len(test_dataset))
+            eval_rng = random.Random(step)
+            eval_indices = eval_rng.sample(range(len(test_dataset)), n_eval)
+            eval_examples = [test_dataset[i] for i in eval_indices]
 
             async def run_eval():
                 eval_inputs = []

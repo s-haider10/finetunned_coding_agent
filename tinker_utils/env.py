@@ -132,6 +132,77 @@ async def sandbox_check_correctness(
         return False, {"error": str(e)}
 
 
+# --- Fractional scoring (Run 2) ---
+# Unlike TEST_CODE which exits -1 on first failure, this runs all tests
+# and prints {"passed": N, "total": M} as JSON to stdout.
+# run_test() does early-return, so len(result) may be < total — we get
+# total from the input count, not from len(result).
+_FRACTIONAL_TEST_CODE = """
+import json
+import sys
+from testing_util import run_test
+
+with open('test_cases.txt', 'r') as fin:
+    sample = json.load(fin)
+with open('code.py', 'r') as fin:
+    code = fin.read()
+
+result, metadata = run_test(sample, code, debug=False, timeout=%(timeout)s)
+passed = sum(1 for x in result if x is True)
+total = len(json.loads(sample["input_output"])["inputs"])
+print(json.dumps({"passed": passed, "total": total}))
+"""
+
+
+async def sandbox_check_correctness_fractional(
+    sample: list[dict[str, Any]], generation: str, timeout: int = 6
+) -> tuple[float, dict[str, Any]]:
+    """Check correctness with fractional score (passed_tests / total_tests)."""
+    assert len(sample) >= 1, "Sample must contain at least one test case"
+
+    test_cases = postprocess_lcb_sample(sample)
+    b64encode = lambda s: base64.b64encode(s.encode("utf-8")).decode("utf-8")
+    try:
+        test_cnt = len(json.loads(test_cases["input_output"])["inputs"])
+        total_timeout = (timeout + 1) * test_cnt + 5
+
+        test_code = _FRACTIONAL_TEST_CODE % {"timeout": timeout}
+        asset = {
+            "test_cases.txt": b64encode(json.dumps(test_cases)),
+            "code.py": b64encode(generation),
+            "testing_util.py": b64encode(TEST_UTIL),
+        }
+
+        payload = {
+            "code": test_code,
+            "language": "python",
+            "run_timeout": total_timeout,
+            "files": asset,
+        }
+
+        session = await _get_sandbox_session()
+        async with session.post(SANDBOX_URL, json=payload) as result:
+            if result.status != 200:
+                raise Exception(
+                    f"Sandbox API responded with code {result.status}: {await result.text()}"
+                )
+            resp = await result.json()
+            # Parse per-test results from stdout
+            # Sandbox puts stdout in resp["run_result"]["stdout"], not resp["output"]
+            run_result = resp.get("run_result") or {}
+            output = run_result.get("stdout", "") if isinstance(run_result, dict) else ""
+            try:
+                counts = json.loads(output.strip().split("\n")[-1])
+                passed = counts["passed"]
+                total = counts["total"]
+                return passed / total if total > 0 else 0.0, resp
+            except (json.JSONDecodeError, KeyError, IndexError):
+                # Fallback: if we can't parse, treat as all-fail
+                return 0.0, resp
+    except Exception as e:
+        return 0.0, {"error": str(e)}
+
+
 class CodeEnv:
     def __init__(
         self,
